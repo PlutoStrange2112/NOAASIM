@@ -10,6 +10,7 @@ venv/
 # Cache and generated files
 cache/
 *.png
+!assets/*.png
 *.gif
 *.mp4
 

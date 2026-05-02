@@ -2,7 +2,7 @@
 
 A real-time weather simulation and visualization system for the continental United States, powered by live NOAA data, fluid boid dynamics, and Fourier-based prediction.
 
-![NOAASIM Preview](cache/test_arrows.png)
+![NOAASIM Preview](assets/preview.png)
 
 ---
 
