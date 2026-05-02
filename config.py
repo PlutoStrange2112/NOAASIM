@@ -8,13 +8,15 @@ BOID_SEPARATION_RADIUS = 1.8   # degrees
 BOID_ALIGNMENT_RADIUS  = 5.0   # degrees — fronts propagate this far
 BOID_COHESION_RADIUS   = 9.0   # degrees — storm systems stay together
 
-SEPARATION_WEIGHT       = 1.8
-ALIGNMENT_WEIGHT        = 1.2
-COHESION_WEIGHT         = 0.7
+SEPARATION_WEIGHT        = 1.8
+ALIGNMENT_WEIGHT         = 1.2
+COHESION_WEIGHT          = 0.7
 PRESSURE_GRADIENT_WEIGHT = 0.6
-CORIOLIS_WEIGHT         = 0.25
-FFT_ATTRACTOR_WEIGHT    = 0.15
-TERRAIN_WEIGHT          = 0.4
+CORIOLIS_WEIGHT          = 0.25
+FFT_ATTRACTOR_WEIGHT     = 0.15
+TERRAIN_WEIGHT           = 0.4
+GEOSTROPHIC_WEIGHT       = 0.35   # nudge toward geostrophic wind balance
+LATENT_HEAT_WEIGHT       = 0.25   # warming/pressure-drop from precipitation
 
 MAX_SPEED  = 1.8   # degrees/hour  (~200 km/hr)
 MIN_SPEED  = 0.02
@@ -53,6 +55,11 @@ SEED_STATIONS = [
     "KCLE", "KDET", "KPIT", "KBUF", "KOMA", "KMCI", "KSLC",
     "KBIL", "KBIS", "KSUX", "KTUL", "KLIT", "KJAN", "KMOB",
 ]
+
+# --- Timeline / playback ---
+TIMELINE_SNAPSHOT_INTERVAL_HOURS = 1.0   # spacing between pre-built snapshots
+TIMELINE_HISTORY_HOURS           = 72.0  # how far back to load from disk
+PLAYBACK_SPEED_HOURS_PER_SEC     = 6.0   # simulated hours played per wall-clock second
 
 # --- Visualization ---
 FPS              = 30

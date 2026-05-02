@@ -33,8 +33,14 @@ from config import (
     SEPARATION_WEIGHT, ALIGNMENT_WEIGHT, COHESION_WEIGHT,
     PRESSURE_GRADIENT_WEIGHT, CORIOLIS_WEIGHT, FFT_ATTRACTOR_WEIGHT,
     TERRAIN_WEIGHT, TERRAIN_FEATURES,
+    GEOSTROPHIC_WEIGHT, LATENT_HEAT_WEIGHT,
     MAX_SPEED, MIN_SPEED, DAMPING, SIM_DT_HOURS,
 )
+
+# Physical constants
+_OMEGA   = 7.2921e-5   # Earth's rotation rate [rad/s]
+_RHO_AIR = 1.225       # surface air density [kg/m³]
+_M_PER_DEG = 111_000.0 # metres per degree of latitude
 
 # ---- Weather type constants ----
 LOW        = 0
@@ -306,7 +312,7 @@ class WeatherSwarm:
         au   += coh_w * ((COH * lons[np.newaxis, :]).sum(axis=1) / cnt_c - lons) * 0.1
         av   += coh_w * ((COH * lats[np.newaxis, :]).sum(axis=1) / cnt_c - lats) * 0.1
 
-        # ---- Pressure gradient (least-squares direction per boid) ----
+        # ---- Pressure gradient (weighted least-squares per boid) [hPa/deg] ----
         PG     = DIST < BOID_ALIGNMENT_RADIUS
         dp_lon = ((PG * (prs[np.newaxis, :] - prs[:, np.newaxis]) * DLON).sum(axis=1)
                   / ((PG * DLON ** 2).sum(axis=1) + 1.0))
@@ -315,8 +321,27 @@ class WeatherSwarm:
         au += PRESSURE_GRADIENT_WEIGHT * dp_lon * 0.005
         av += PRESSURE_GRADIENT_WEIGHT * dp_lat * 0.005
 
+        # ---- Geostrophic wind (physically-derived balance force) ----
+        # Converts estimated pressure gradient [hPa/deg] → SI [Pa/m], then
+        # computes u_geo, v_geo [m/s] via geostrophic relation, converts to
+        # [deg/hr], and nudges boid velocity toward that balance state.
+        f_SI = 2.0 * _OMEGA * np.sin(np.radians(lats))              # [rad/s]
+        f_SI = np.where(np.abs(f_SI) < 5e-5,
+                        np.sign(f_SI + 1e-30) * 5e-5, f_SI)         # clamp near equator
+        m_per_deg_lon = _M_PER_DEG * cos_lats
+        dp_dx_SI = dp_lon * 100.0 / (m_per_deg_lon + 1e-3)          # [Pa/m]
+        dp_dy_SI = dp_lat * 100.0 / _M_PER_DEG                      # [Pa/m]
+        recip_fρ = 1.0 / (f_SI * _RHO_AIR)
+        u_geo_ms = -recip_fρ * dp_dy_SI                              # [m/s]
+        v_geo_ms =  recip_fρ * dp_dx_SI                              # [m/s]
+        scale_ms = 3600.0 / _M_PER_DEG                               # m/s → deg/hr
+        u_geo = np.clip(u_geo_ms * scale_ms, -MAX_SPEED, MAX_SPEED)
+        v_geo = np.clip(v_geo_ms * scale_ms, -MAX_SPEED, MAX_SPEED)
+        au += GEOSTROPHIC_WEIGHT * (u_geo - vus)
+        av += GEOSTROPHIC_WEIGHT * (v_geo - vvs)
+
         # ---- Coriolis (NH right-turn) ----
-        f_hr = 2 * 7.2921e-5 * np.sin(np.radians(lats)) * 3600 * 0.01
+        f_hr = 2 * _OMEGA * np.sin(np.radians(lats)) * 3600 * 0.01
         au  += CORIOLIS_WEIGHT *  f_hr * vvs
         av  -= CORIOLIS_WEIGHT *  f_hr * vus
 
@@ -339,12 +364,21 @@ class WeatherSwarm:
         new_lats = lats + new_vv * dt
         new_lons = lons + new_vu * dt
 
+        # ---- Latent heat: precipitation warms parcel, drops pressure ----
+        precip_arr = np.array([b.precip for b in self.boids])
+        latent     = LATENT_HEAT_WEIGHT * np.maximum(0.0, precip_arr - 0.1) * dt
+
         # ---- Write back + per-boid ops (trail, FFT attractor, boundary) ----
         for i, b in enumerate(self.boids):
             b.vel_u = float(new_vu[i])
             b.vel_v = float(new_vv[i])
             b.lat   = float(new_lats[i])
             b.lon   = float(new_lons[i])
+
+            # Latent heat: condensation warms air and lowers surface pressure
+            if latent[i] > 0.0:
+                b.temp_c   += float(latent[i])
+                b.pressure -= float(latent[i]) * 0.4   # ~0.4 hPa / °C warming
 
             if self.fft_analyzers and i < len(self.fft_analyzers):
                 self._apply_fft_attractor(b, i, dt)
@@ -429,11 +463,11 @@ class WeatherSwarm:
     def snapshot(self):
         """Return arrays suitable for fast rendering."""
         n = len(self.boids)
-        lats     = np.empty(n); lons     = np.empty(n)
-        vus      = np.empty(n); vvs      = np.empty(n)
-        temps    = np.empty(n); pressures= np.empty(n)
-        humids   = np.empty(n); precips  = np.empty(n)
-        btypes   = np.empty(n, dtype=int)
+        lats      = np.empty(n); lons      = np.empty(n)
+        vus       = np.empty(n); vvs       = np.empty(n)
+        temps     = np.empty(n); pressures = np.empty(n)
+        humids    = np.empty(n); precips   = np.empty(n)
+        btypes    = np.empty(n, dtype=int)
         for i, b in enumerate(self.boids):
             lats[i]      = b.lat;      lons[i]      = b.lon
             vus[i]       = b.vel_u;    vvs[i]       = b.vel_v
@@ -446,5 +480,88 @@ class WeatherSwarm:
             "temp_c": temps, "pressure": pressures,
             "humidity": humids, "precip": precips,
             "btypes": btypes,
-            "trails": [b.trail for b in self.boids],
+            "trails": [list(b.trail) for b in self.boids],
         }
+
+    # ------------------------------------------------------------------
+    # Timeline construction (past recordings + fast-forward future)
+    # ------------------------------------------------------------------
+
+    def build_timeline(self, recorded_snapshots=None,
+                       future_hours=120.0,
+                       snapshot_interval_hours=1.0,
+                       dt=None):
+        """
+        Build an ordered list of {hour_offset, snap} covering:
+          • Recorded past  — real snapshots loaded from disk (hour_offset < 0)
+          • Present        — current swarm state (hour_offset = 0)
+          • Predicted future — fast-forward of a saved/restored swarm clone
+
+        Returns list sorted by hour_offset.  Does NOT modify swarm state.
+        """
+        import logging
+        log = logging.getLogger(__name__)
+
+        if dt is None:
+            dt = SIM_DT_HOURS
+
+        result = []
+
+        # Past: from recorder (hour_offset already negative)
+        if recorded_snapshots:
+            for entry in recorded_snapshots:
+                result.append({
+                    "hour_offset": entry["hour_offset"],
+                    "snap":        entry["snap"],
+                })
+            log.info("Timeline: loaded %d past snapshots", len(recorded_snapshots))
+
+        # Present
+        result.append({"hour_offset": 0.0, "snap": self.snapshot()})
+
+        # Future: run a saved-state clone forward
+        log.info("Timeline: fast-forwarding %.0f hours into future …", future_hours)
+        future = self._fast_forward(future_hours, snapshot_interval_hours, dt)
+        result.extend(future)
+        log.info("Timeline: built %d total entries (past+present+future)", len(result))
+
+        result.sort(key=lambda x: x["hour_offset"])
+        return result
+
+    def _fast_forward(self, future_hours, interval_hours, dt):
+        """
+        Temporarily run the swarm forward, collecting snapshots, then restore
+        original state.  Returns list of {hour_offset, snap}.
+        """
+        # --- Save full boid state ---
+        saved = [
+            (b.lat, b.lon, b.vel_u, b.vel_v,
+             b.temp_c, b.pressure, b.humidity, b.precip,
+             b.wind_u, b.wind_v, b.btype, b.age, list(b.trail))
+            for b in self.boids
+        ]
+        saved_hour = self.hour_elapsed
+
+        snaps        = []
+        steps_per_snap = max(1, round(interval_hours / dt))
+        total_steps    = max(1, round(future_hours  / dt))
+
+        try:
+            for step_i in range(1, total_steps + 1):
+                self.step(dt=dt, trail_len=10)
+                if step_i % steps_per_snap == 0:
+                    snaps.append({
+                        "hour_offset": float(step_i * dt),
+                        "snap":        self.snapshot(),
+                    })
+        finally:
+            # --- Restore unconditionally ---
+            self.hour_elapsed = saved_hour
+            for i, b in enumerate(self.boids):
+                s = saved[i]
+                (b.lat, b.lon, b.vel_u, b.vel_v,
+                 b.temp_c, b.pressure, b.humidity, b.precip,
+                 b.wind_u, b.wind_v, b.btype, b.age) = s[:12]
+                b.trail = s[12]
+
+        return snaps

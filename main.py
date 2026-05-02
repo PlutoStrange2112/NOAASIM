@@ -1,16 +1,22 @@
 """
 NOAA AI Weather Visualization
 ==============================
-Run:  python main.py           (window opens immediately, NOAA loads in background)
-      python main.py --no-api  (fully offline)
+Run:  python main.py           (window opens with timeline, NOAA loads in background)
+      python main.py --no-api  (fully offline / synthetic only)
       python main.py --boids 500
-      python main.py --full-history  (730-day FFT history instead of 30-day default)
+      python main.py --full-history  (730-day FFT history — richer prediction)
 
-Startup sequence (window opens in ~3-5 seconds):
+Startup sequence:
   1. Synthetic seed → boids ready immediately
-  2. FFT analysers built from 30-day history (fast default)
-  3. Window opens with animated boids
-  4. Background thread fetches NOAA live data and injects into swarm
+  2. FFT analysers built from 30-day history
+  3. Past snapshots loaded from disk (previous sessions)
+  4. Timeline fast-forwarded (120 hours into future) — this takes a few seconds
+  5. Window opens: slider covers full history → present → future
+  6. Background thread fetches NOAA live data and injects into swarm
+
+Data grows every session:
+  Each run records NOAA observations and live snapshots to cache/,
+  which future sessions load for the historical half of the timeline.
 """
 
 import argparse
@@ -38,10 +44,11 @@ def main():
     if args.boids:
         config.NUM_BOIDS = args.boids
 
-    rng = np.random.default_rng(0)
+    rng        = np.random.default_rng(0)
+    start_time = datetime.datetime.now(datetime.timezone.utc)
 
     # ------------------------------------------------------------------
-    # 1. Build swarm with synthetic seed (fast — window opens quickly)
+    # 1. Build swarm with synthetic seed
     # ------------------------------------------------------------------
     log.info("Seeding %d weather boids from synthetic climatology …", config.NUM_BOIDS)
     from simulation.boids import WeatherSwarm
@@ -50,7 +57,7 @@ def main():
     log.info("  Swarm ready: %d boids", len(swarm.boids))
 
     # ------------------------------------------------------------------
-    # 2. Build FFT analysers (30-day default → ~2 s for 350 boids)
+    # 2. Build FFT analysers
     # ------------------------------------------------------------------
     history_days = 730 if args.full_history else 30
     log.info("Building FFT analysers (%d-day history per boid) …", history_days)
@@ -69,7 +76,32 @@ def main():
     log.info("  FFT analysers ready")
 
     # ------------------------------------------------------------------
-    # 3. Background NOAA fetch — injects real data while window is open
+    # 3. Load recorded snapshots from previous sessions
+    # ------------------------------------------------------------------
+    from data import recorder
+    log.info("Loading past snapshots from disk …")
+    past_snaps = recorder.load_recent_snapshots(hours=config.TIMELINE_HISTORY_HOURS)
+    if past_snaps:
+        log.info("  Loaded %d past snapshots (%.0f h of history)",
+                 len(past_snaps), config.TIMELINE_HISTORY_HOURS)
+    else:
+        log.info("  No past snapshots on disk — first session")
+
+    # ------------------------------------------------------------------
+    # 4. Build pre-computed timeline (present + future fast-forward)
+    # ------------------------------------------------------------------
+    log.info("Building timeline (%.0f h future fast-forward) …",
+             config.PREDICTION_HOURS)
+    timeline = swarm.build_timeline(
+        recorded_snapshots       = past_snaps,
+        future_hours             = config.PREDICTION_HOURS,
+        snapshot_interval_hours  = config.TIMELINE_SNAPSHOT_INTERVAL_HOURS,
+    )
+    log.info("  Timeline ready: %d snapshots", len(timeline))
+
+    # ------------------------------------------------------------------
+    # 5. Background NOAA fetch — injects real data while window is open
+    #    and records observations to disk for future sessions
     # ------------------------------------------------------------------
     if not args.no_api:
         def _noaa_worker():
@@ -80,7 +112,12 @@ def main():
                 obs = fetch_station_observations_parallel(SEED_STATIONS)
                 if obs:
                     swarm.apply_observations(obs)
-                    log.info("[NOAA] Applied %d live station observations to swarm", len(obs))
+                    log.info("[NOAA] Applied %d live observations to swarm", len(obs))
+                    try:
+                        recorder.record_observations(obs, timestamp=start_time)
+                        log.info("[NOAA] Recorded %d observations to disk", len(obs))
+                    except Exception as exc:
+                        log.warning("[NOAA] Failed to record observations: %s", exc)
                 else:
                     log.info("[NOAA] No observations returned — staying on synthetic data")
             except Exception as exc:
@@ -92,15 +129,17 @@ def main():
         log.info("--no-api set; running fully offline")
 
     # ------------------------------------------------------------------
-    # 4. Launch renderer (blocks until window is closed)
+    # 6. Launch renderer (blocks until window is closed)
     # ------------------------------------------------------------------
     log.info("Opening visualization window …")
     from visualization.renderer import WeatherRenderer
 
     renderer = WeatherRenderer(
         swarm      = swarm,
+        timeline   = timeline,
         mode       = "realtime",
-        start_time = datetime.datetime.now(datetime.timezone.utc),
+        start_time = start_time,
+        recorder   = recorder,
     )
     renderer.run()
 
