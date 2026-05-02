@@ -104,6 +104,9 @@ class WeatherRenderer:
         self._slider_dragging = False
         self._record_frame_interval = 60   # record snapshot every N frames
 
+        # Click-to-inspect popup
+        self._popup = None
+
         # Interpolation grid
         self._grid_lon, self._grid_lat = np.meshgrid(
             np.linspace(LON_MIN, LON_MAX, _IGRID_LON),
@@ -291,6 +294,26 @@ class WeatherRenderer:
             family="monospace",
         )
 
+        # ---- Lat/Lon coordinate input boxes ----
+        # Positioned bottom-right, beside the pause button
+        from matplotlib.widgets import TextBox
+        ax_lat_box = self.fig.add_axes([0.73, 0.075, 0.055, 0.025])
+        ax_lon_box = self.fig.add_axes([0.79, 0.075, 0.055, 0.025])
+        self._lat_box = TextBox(ax_lat_box, "Lat ", initial="", color="#111122",
+                                hovercolor="#1a2233", label_pad=0.05)
+        self._lon_box = TextBox(ax_lon_box, "Lon ", initial="", color="#111122",
+                                hovercolor="#1a2233", label_pad=0.05)
+        for tb in (self._lat_box, self._lon_box):
+            tb.label.set_color("#aabbcc")
+            tb.label.set_fontsize(7)
+            tb.text_disp.set_color("#ddeeff")
+            tb.text_disp.set_fontsize(7)
+        self._lat_box.on_submit(self._on_coord_submit)
+        self._lon_box.on_submit(self._on_coord_submit)
+
+        # ---- Click-to-inspect ----
+        self.fig.canvas.mpl_connect("button_press_event", self._on_map_click)
+
         # Render initial frame
         self._render_from_snap(snap0, self._hour_offset_at(self._playhead))
 
@@ -309,6 +332,170 @@ class WeatherRenderer:
         self._render_from_snap(snap, val)
         self.fig.canvas.draw_idle()
         self._slider_dragging = False
+
+    # ------------------------------------------------------------------
+    # Click-to-inspect and coordinate lookup
+    # ------------------------------------------------------------------
+
+    def _on_map_click(self, event):
+        """Left-click on map: show weather info popup. Click again to dismiss."""
+        # Dismiss existing popup on every click
+        if self._popup is not None:
+            try:
+                self._popup.remove()
+            except Exception:
+                pass
+            self._popup = None
+            self.fig.canvas.draw_idle()
+            # If click was outside the map or not a left-click, stop here
+            if event.inaxes != self.ax or event.button != 1:
+                return
+            # If click was close to where popup already was, treat as dismiss
+            if (hasattr(self, "_popup_lon") and hasattr(self, "_popup_lat") and
+                    abs(event.xdata - self._popup_lon) < 1.5 and
+                    abs(event.ydata - self._popup_lat) < 1.0):
+                return
+
+        if event.inaxes != self.ax or event.button != 1:
+            return
+        if event.xdata is None or event.ydata is None:
+            return
+
+        self._show_location_popup(event.xdata, event.ydata)
+
+    def _on_coord_submit(self, text):
+        """Called when user presses Enter in either lat/lon text box."""
+        try:
+            lat = float(self._lat_box.text.strip())
+            lon = float(self._lon_box.text.strip())
+        except ValueError:
+            return   # incomplete — wait for both fields to be valid
+        from config import LAT_MIN, LAT_MAX, LON_MIN, LON_MAX
+        lat = max(LAT_MIN, min(LAT_MAX, lat))
+        lon = max(LON_MIN, min(LON_MAX, lon))
+        # Dismiss any existing popup, then show at given coords
+        if self._popup is not None:
+            try:
+                self._popup.remove()
+            except Exception:
+                pass
+            self._popup = None
+        self._show_location_popup(lon, lat)
+
+    def _show_location_popup(self, lon, lat):
+        """Interpolate weather at (lon, lat) from current snap and show popup."""
+        snap = self._snap_at(self._playhead)
+        if snap is None:
+            snap = self.swarm.snapshot()
+
+        hour = self._hour_offset_at(self._playhead)
+        text = self._make_popup_text(lat, lon, snap, hour)
+
+        self._popup_lon = lon
+        self._popup_lat = lat
+
+        # Position the text box: right of click by default; flip near edges
+        lon_span = LON_MAX - LON_MIN
+        lat_span = LAT_MAX - LAT_MIN
+        off_lon  = lon_span * 0.14
+        off_lat  = lat_span * 0.04
+
+        txt_lon = lon + off_lon
+        txt_lat = lat + off_lat
+
+        if txt_lon > LON_MAX - lon_span * 0.28:
+            txt_lon = lon - off_lon
+        if txt_lat > LAT_MAX - lat_span * 0.35:
+            txt_lat = lat - lat_span * 0.25
+
+        self._popup = self.ax.annotate(
+            text,
+            xy=(lon, lat),
+            xytext=(txt_lon, txt_lat),
+            fontsize=7.5,
+            family="monospace",
+            color="#ddeeff",
+            va="top", ha="left",
+            bbox=dict(
+                boxstyle="round,pad=0.6",
+                facecolor="#0a1520",
+                edgecolor="#4477bb",
+                alpha=0.93,
+                linewidth=1.5,
+            ),
+            arrowprops=dict(
+                arrowstyle="->",
+                color="#4477bb",
+                lw=1.2,
+                connectionstyle="arc3,rad=0.1",
+            ),
+            zorder=20,
+        )
+        self.fig.canvas.draw_idle()
+
+    @staticmethod
+    def _make_popup_text(lat, lon, snap, hour_offset):
+        """Build the text shown inside the click popup."""
+        import math as _math
+
+        # --- Interpolate fields at click point using inverse-distance weighting ---
+        dists = np.hypot(snap["lons"] - lon, snap["lats"] - lat).clip(1e-4)
+        # Use 8 nearest boids for weighted average
+        nn    = min(8, len(dists))
+        idx   = np.argpartition(dists, nn - 1)[:nn]
+        w     = 1.0 / dists[idx] ** 2
+        w    /= w.sum()
+
+        temp_c   = float(np.dot(w, snap["temp_c"][idx]))
+        pressure = float(np.dot(w, snap["pressure"][idx]))
+        humidity = float(np.dot(w, snap["humidity"][idx]))
+        precip   = float(np.dot(w, snap["precip"][idx]))
+        vel_u    = float(np.dot(w, snap["vel_u"][idx]))
+        vel_v    = float(np.dot(w, snap["vel_v"][idx]))
+
+        # Dominant weather type
+        from collections import Counter
+        btype_count = Counter(int(snap["btypes"][i]) for i in idx)
+        btype = btype_count.most_common(1)[0][0]
+        type_label = _TYPE_LABEL.get(btype, "Unknown")
+
+        # Derived values
+        temp_f     = temp_c * 9 / 5 + 32
+        speed_dhr  = _math.hypot(vel_u, vel_v)
+        speed_ms   = speed_dhr * 111_000 / 3600
+        speed_mph  = speed_ms * 2.237
+        dir_deg    = (_math.degrees(_math.atan2(vel_u, vel_v))) % 360
+        compass    = ["N","NNE","NE","ENE","E","ESE","SE","SSE",
+                      "S","SSW","SW","WSW","W","WNW","NW","NNW"]
+        wind_dir   = compass[round(dir_deg / 22.5) % 16]
+
+        # Time label
+        if hour_offset < -0.25:
+            time_tag = f"T{hour_offset:+.1f} h (history)"
+        elif hour_offset < 0.25:
+            time_tag = "current (live)"
+        else:
+            time_tag = f"T+{hour_offset:.1f} h (forecast)"
+
+        lat_tag = f"{'N' if lat >= 0 else 'S'}"
+        lon_tag = f"{'E' if lon >= 0 else 'W'}"
+
+        lines = [
+            "── LOCATION WEATHER ──",
+            f"  Lat  {abs(lat):6.2f}° {lat_tag}",
+            f"  Lon  {abs(lon):7.2f}° {lon_tag}",
+            f"  Time {time_tag}",
+            "──────────────────────",
+            f"  Type     {type_label}",
+            f"  Temp     {temp_c:.1f} °C / {temp_f:.1f} °F",
+            f"  Pressure {pressure:.1f} hPa",
+            f"  Humidity {humidity:.0f}%",
+            f"  Wind     {speed_ms:.1f} m/s ({speed_mph:.0f} mph) {wind_dir}",
+            f"  Precip   {precip:.2f} mm/hr",
+            "──────────────────────",
+            "  Click map to dismiss",
+        ]
+        return "\n".join(lines)
 
     # ------------------------------------------------------------------
     # Frame update (FuncAnimation callback)
