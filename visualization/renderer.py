@@ -35,7 +35,7 @@ import matplotlib.animation as animation
 import matplotlib.colors as mcolors
 from matplotlib.collections import LineCollection
 from matplotlib.widgets import Slider, Button
-from scipy.interpolate import griddata
+from scipy.spatial import cKDTree
 from scipy.ndimage import gaussian_filter
 
 from visualization.map_base import USAMapBase
@@ -112,6 +112,18 @@ class WeatherRenderer:
             np.linspace(LON_MIN, LON_MAX, _IGRID_LON),
             np.linspace(LAT_MIN, LAT_MAX, _IGRID_LAT),
         )
+        # Pre-flattened grid points for KD-tree queries (built once, reused every frame)
+        self._grid_pts = np.column_stack([
+            self._grid_lon.ravel(),
+            self._grid_lat.ravel(),
+        ])
+
+        # KD-tree cache — rebuilt only when boid positions change
+        self._kd_tree      = None
+        self._kd_snap_lons = None   # id() of the last lons array used
+
+        # Skip-render optimisation — avoid re-drawing identical frames
+        self._last_rendered_snap = None
 
         self._build_figure()
 
@@ -543,12 +555,17 @@ class WeatherRenderer:
                 except Exception:
                     pass
 
-        snap      = self._snap_at(self._playhead)
-        hour      = self._hour_offset_at(self._playhead)
+        snap = self._snap_at(self._playhead)
+        hour = self._hour_offset_at(self._playhead)
 
-        self._render_from_snap(snap, hour)
+        # Skip expensive re-render when snap hasn't changed (common in timeline
+        # playback: at 30 FPS and 6 hr/s playback, each 1-hr snapshot shows for
+        # ~5 consecutive frames — skip 4 of them).
+        if snap is not self._last_rendered_snap:
+            self._render_from_snap(snap, hour)
+            self._last_rendered_snap = snap
 
-        # Keep slider in sync (without triggering on_changed)
+        # Always update lightweight overlays: slider, title, zone label
         if not self._slider_dragging:
             self._slider.eventson = False
             self._slider.set_val(float(hour))
@@ -564,16 +581,24 @@ class WeatherRenderer:
         if snap is None:
             return
 
-        pts = np.column_stack([snap["lons"], snap["lats"]])
+        # ---- KD-tree nearest-neighbour interpolation (replaces 3× griddata) ----
+        # griddata(method='nearest') rebuilds a cKDTree from scratch every call.
+        # We cache the tree and rebuild only when boid positions change, then
+        # query once and reuse the index for temp, pressure, and precip.
+        lons_id = id(snap["lons"])
+        if lons_id != self._kd_snap_lons:
+            pts = np.column_stack([snap["lons"], snap["lats"]])
+            self._kd_tree      = cKDTree(pts)
+            self._kd_snap_lons = lons_id
+        _, nn_idx = self._kd_tree.query(self._grid_pts)   # one query, three uses
 
         # Temperature
-        grid_t = griddata(pts, snap["temp_c"], (self._grid_lon, self._grid_lat),
-                          method="nearest")
-        grid_t = gaussian_filter(grid_t.astype(float), sigma=2.5)
+        grid_t = snap["temp_c"][nn_idx].reshape(_IGRID_LAT, _IGRID_LON).astype(float)
+        grid_t = gaussian_filter(grid_t, sigma=2.5)
         self._temp_img.set_data(grid_t)
 
-        # Pressure contours (throttled to every 3 calls from animation)
-        self._contour_tick = (self._contour_tick + 1) % 3
+        # Pressure contours — throttled to every 10 render calls
+        self._contour_tick = (self._contour_tick + 1) % 10
         if self._contour_tick == 0:
             for cs in self._contour_artists:
                 cs.remove()
@@ -584,9 +609,8 @@ class WeatherRenderer:
                     pass
             self._contour_artists.clear()
             self._clabel_texts.clear()
-            grid_p = griddata(pts, snap["pressure"], (self._grid_lon, self._grid_lat),
-                              method="nearest")
-            grid_p = gaussian_filter(grid_p.astype(float), sigma=1.5)
+            grid_p = snap["pressure"][nn_idx].reshape(_IGRID_LAT, _IGRID_LON).astype(float)
+            grid_p = gaussian_filter(grid_p, sigma=1.5)
             try:
                 cs = self.ax.contour(
                     self._grid_lon, self._grid_lat, grid_p,
@@ -600,27 +624,25 @@ class WeatherRenderer:
                 pass
 
         # Precipitation
-        grid_pr = griddata(pts, snap["precip"], (self._grid_lon, self._grid_lat),
-                           method="nearest", fill_value=0)
-        self._precip_img.set_data(np.clip(grid_pr, 0, 5))
+        grid_pr = snap["precip"][nn_idx].reshape(_IGRID_LAT, _IGRID_LON).clip(0, 5)
+        self._precip_img.set_data(grid_pr)
         max_pr = float(grid_pr.max())
         self._precip_img.set_alpha(min(0.45, max_pr * 0.15) if max_pr > 0.1 else 0.0)
 
-        # Trails
-        segments   = []
-        seg_colors = []
+        # Trails — vectorised segment building (np.stack replaces inner Python loop)
+        all_segs   = []
+        all_colors = []
         for trail, btype in zip(snap["trails"], snap["btypes"]):
             if len(trail) < 2:
                 continue
-            trail_a = np.array(trail)
-            xy      = trail_a[:, ::-1]
-            color   = _TYPE_CMAP.get(int(btype), "#aaaaaa")
-            for j in range(len(xy) - 1):
-                segments.append([xy[j], xy[j + 1]])
-                seg_colors.append(color)
-        if segments:
-            self._trail_coll.set_segments(segments)
-            self._trail_coll.set_color(seg_colors)
+            xy   = np.asarray(trail, dtype=float)[:, ::-1]   # (lon, lat) for x,y
+            segs = np.stack([xy[:-1], xy[1:]], axis=1)        # (T-1, 2, 2)
+            all_segs.append(segs)
+            color = _TYPE_CMAP.get(int(btype), "#aaaaaa")
+            all_colors.extend([color] * len(segs))
+        if all_segs:
+            self._trail_coll.set_segments(np.concatenate(all_segs, axis=0))
+            self._trail_coll.set_color(all_colors)
         else:
             self._trail_coll.set_segments([])
 

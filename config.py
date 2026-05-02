@@ -68,7 +68,7 @@ TIMELINE_HISTORY_HOURS           = 72.0  # how far back to load from disk
 PLAYBACK_SPEED_HOURS_PER_SEC     = 6.0   # simulated hours played per wall-clock second
 
 # --- Visualization ---
-FPS              = 30
+FPS              = 60
 SIM_DT_HOURS     = 0.5    # simulation hours per animation frame
 BACKGROUND_ALPHA = 0.75
 BOID_ARROW_SCALE = 0.4    # quiver scale factor

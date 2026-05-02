@@ -161,12 +161,15 @@ def _colored_noise(n, tau, rng):
     """
     First-order autoregressive noise with decorrelation time tau steps.
     Returns zero-mean, unit-variance series.
+
+    Uses scipy.signal.lfilter (C-speed IIR filter) instead of a Python loop —
+    ~20× faster for long series, which matters at startup when we generate
+    history for 350 boids × 6 variables × up to 17520 hours.
     """
+    from scipy.signal import lfilter
     alpha = np.exp(-1.0 / tau)
+    scale = np.sqrt(1 - alpha ** 2)
     white = rng.standard_normal(n)
-    out   = np.zeros(n)
-    out[0] = white[0]
-    scale  = np.sqrt(1 - alpha ** 2)
-    for i in range(1, n):
-        out[i] = alpha * out[i - 1] + scale * white[i]
-    return out
+    # IIR recurrence: out[i] = alpha*out[i-1] + scale*white[i]
+    # lfilter(b, a, x): a[0]*y[n] = b[0]*x[n] - a[1]*y[n-1]
+    return lfilter([scale], [1.0, -alpha], white)
