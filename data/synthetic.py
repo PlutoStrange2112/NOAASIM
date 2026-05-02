@@ -21,13 +21,15 @@ from config import SYNTHETIC_HISTORY_DAYS
 
 def _mean_temp_c(lat, lon, doy):
     """Annual mean temperature as a function of lat/lon and day-of-year."""
-    # latitude lapse: ~-0.55 C per degree north from 25 N
-    base = 30.0 - 0.55 * (lat - 25.0)
-    # Pacific coast moderating effect
+    # Calibrated against NOAA climate normals for continental US cities.
+    # Annual mean lapse: ~-0.82 C per degree north (Miami ~22.8 C, Minneapolis ~7.2 C).
+    base = 44.0 - 0.82 * lat
+    # Pacific coast: ocean keeps winters warmer, summers cooler
     if lon < -115:
-        base += max(0, (lon + 125) * 0.4)
-    # annual cycle amplitude
-    amp = 12.0 + 0.4 * (lat - 30.0)
+        base += max(0, (lon + 125) * 1.0)
+    # Annual cycle amplitude: grows with latitude (larger swing in north)
+    amp = 6.0 + 0.6 * (lat - 25.0)
+    # Peak at ~day 200 (mid-July), trough ~day 17 (mid-January)
     return base + amp * np.cos(2 * np.pi * (doy - 200) / 365.25)
 
 
@@ -66,9 +68,13 @@ def _prevailing_wind(lat, lon, doy):
 # Main generator
 # ---------------------------------------------------------------------------
 
-def generate_history(lat, lon, hours=None, seed=None):
+def generate_history(lat, lon, hours=None, seed=None, start_doy=None):
     """
-    Generate synthetic hourly weather history.
+    Generate synthetic hourly weather history anchored to the actual calendar.
+
+    start_doy : fractional day-of-year the history begins (0–365).
+                Defaults to (today's DOY - hours/24), so the last entry
+                aligns with today's date and seasonal conditions.
 
     Returns dict of 1-D numpy arrays, all length `hours`:
         t          – hours since start
@@ -82,10 +88,16 @@ def generate_history(lat, lon, hours=None, seed=None):
     if hours is None:
         hours = SYNTHETIC_HISTORY_DAYS * 24
 
+    if start_doy is None:
+        import datetime
+        doy_today = datetime.date.today().timetuple().tm_yday
+        start_doy = (doy_today - hours / 24) % 365.25
+
     rng = np.random.default_rng(seed if seed is not None else int(abs(lat * 100 + lon)))
 
     t      = np.arange(hours, dtype=float)
-    doy_hr = (t % (365.25 * 24)) / 24  # fractional day of year
+    # Fractional day-of-year for each hour, anchored to actual calendar date
+    doy_hr = ((start_doy * 24 + t) % (365.25 * 24)) / 24
 
     # ---- Temperature ----
     T_mean = _mean_temp_c(lat, lon, doy_hr)

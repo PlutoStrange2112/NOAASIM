@@ -200,11 +200,56 @@ class WeatherSwarm:
         self.boids = []
         self._fill_random(n)
 
+    def seed_from_real_interpolation(self, observations):
+        """
+        Overwrite every boid's weather state by IDW-interpolating from real
+        NOAA station observations.  Called synchronously before the window
+        opens so all boids start with real conditions, not synthetic guesses.
+
+        Returns True if at least one valid observation was used.
+        """
+        valid = [o for o in observations
+                 if o.get("lat") is not None and o.get("lon") is not None
+                 and LAT_MIN <= o["lat"] <= LAT_MAX
+                 and LON_MIN <= o["lon"] <= LON_MAX]
+        if not valid:
+            return False
+
+        obs_lats = np.array([o["lat"]      for o in valid])
+        obs_lons = np.array([o["lon"]      for o in valid])
+        obs_temp = np.array([o["temp_c"]   for o in valid])
+        obs_pres = np.array([o["pressure"] for o in valid])
+        obs_humi = np.array([o["humidity"] for o in valid])
+        obs_prec = np.array([o["precip"]   for o in valid])
+        obs_wu   = np.array([o["wind_u"]   for o in valid])
+        obs_wv   = np.array([o["wind_v"]   for o in valid])
+
+        scale = 3600.0 / 111_000.0  # m/s → deg/hr
+        cos_mid = math.cos(math.radians(0.5 * (LAT_MIN + LAT_MAX)))
+
+        for b in self.boids:
+            dlat = obs_lats - b.lat
+            dlon = (obs_lons - b.lon) * cos_mid
+            dists = np.hypot(dlat, dlon).clip(1e-4)
+            w = 1.0 / dists ** 2
+            w /= w.sum()
+
+            b.temp_c   = float(np.dot(w, obs_temp))
+            b.pressure = float(np.dot(w, obs_pres))
+            b.humidity = float(np.dot(w, obs_humi))
+            b.precip   = float(np.dot(w, obs_prec))
+            b.wind_u   = float(np.dot(w, obs_wu))
+            b.wind_v   = float(np.dot(w, obs_wv))
+            b.vel_u    = b.wind_u * scale
+            b.vel_v    = b.wind_v * scale
+            b.btype    = _classify_type(b.pressure, b.temp_c,
+                                         math.hypot(b.wind_u, b.wind_v))
+        return True
+
     def apply_observations(self, observations):
         """
-        Inject real NOAA station observations into the nearest boids.
-        Safe to call from a background thread — only writes scalar attributes
-        (protected by Python's GIL).  Called once after async NOAA fetch.
+        Inject updated NOAA observations into the nearest boids (background refresh).
+        Safe to call from a background thread — only writes scalar attributes.
         """
         scale = 3600.0 / 111_000.0  # m/s → deg/hr
         lats  = [b.lat for b in self.boids]
@@ -215,13 +260,12 @@ class WeatherSwarm:
                 continue
             if not (LAT_MIN <= obs["lat"] <= LAT_MAX and LON_MIN <= obs["lon"] <= LON_MAX):
                 continue
-            # find nearest boid
             best_i, best_d2 = 0, float("inf")
             for i, (blat, blon) in enumerate(zip(lats, lons)):
                 d2 = (blat - obs["lat"]) ** 2 + (blon - obs["lon"]) ** 2
                 if d2 < best_d2:
                     best_d2, best_i = d2, i
-            if best_d2 > 8 ** 2:   # skip if no boid within 8 degrees
+            if best_d2 > 8 ** 2:
                 continue
             b = self.boids[best_i]
             b.temp_c   = obs["temp_c"]
