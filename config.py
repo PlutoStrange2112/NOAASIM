@@ -54,6 +54,12 @@ SEED_STATIONS = [
     "KATL", "KMIA", "KCLT", "KDCA", "KBOS", "KJFK", "KPHL",
     "KCLE", "KDET", "KPIT", "KBUF", "KOMA", "KMCI", "KSLC",
     "KBIL", "KBIS", "KSUX", "KTUL", "KLIT", "KJAN", "KMOB",
+    # West Virginia — improves accuracy for the Monongalia/Marion county area
+    "KCKB",   # North Central WV Airport (Clarksburg/Bridgeport — nearest to Fairmont)
+    "KMGW",   # Morgantown Municipal (WVU area)
+    "KCRW",   # Yeager Airport (Charleston)
+    "KHTS",   # Tri-State Airport (Huntington)
+    "KBKW",   # Raleigh County Memorial (Beckley)
 ]
 
 # --- Timeline / playback ---
