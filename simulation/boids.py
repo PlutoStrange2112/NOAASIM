@@ -285,8 +285,11 @@ class WeatherSwarm:
         SAME = (types[:, np.newaxis] == types[np.newaxis, :])  # (N, N) bool
 
         # ---- Separation ----
-        SEP   = DIST < BOID_SEPARATION_RADIUS
-        w_sep = np.where(SEP, (BOID_SEPARATION_RADIUS - DIST) / (DIST + 1e-6), 0.0)
+        # errstate: np.where evaluates both branches; diagonal DIST=inf produces
+        # inf/inf=NaN in the false branch which is then discarded — suppress it.
+        SEP = DIST < BOID_SEPARATION_RADIUS
+        with np.errstate(invalid="ignore", divide="ignore"):
+            w_sep = np.where(SEP, (BOID_SEPARATION_RADIUS - DIST) / (DIST + 1e-6), 0.0)
         cnt   = SEP.sum(axis=1) + 1
         au    = -sep_w * (w_sep * DLON).sum(axis=1) / cnt
         av    = -sep_w * (w_sep * DLAT).sum(axis=1) / cnt

@@ -102,12 +102,11 @@ def get_station_observation(station_id):
 # Bulk fetch — parallel with ThreadPoolExecutor
 # ---------------------------------------------------------------------------
 
-def fetch_station_observations_parallel(station_ids, max_workers=12):
+def fetch_station_observations_parallel(station_ids, max_workers=8):
     """
     Fetch observations for all station IDs in parallel.
-    Uses as_completed so fast stations return immediately.
-    Slow / unresponsive stations are abandoned after the per-request timeout
-    already set in _get() — no global timeout needed here.
+    max_workers=8 matches urllib3's default connection pool size (10) with
+    headroom, avoiding the 'Connection pool is full' warning.
     """
     from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as FutTimeout
 
@@ -118,10 +117,14 @@ def fetch_station_observations_parallel(station_ids, max_workers=12):
             return None
 
     results = []
+    # Generous timeout: NOAA can be slow but each request already has a 6s
+    # socket timeout, so worst case = ceil(n / workers) * 6s + slack.
+    wall_timeout = (len(station_ids) / max_workers + 1) * 8
+
     with ThreadPoolExecutor(max_workers=max_workers) as pool:
         futures = {pool.submit(_fetch_one, sid): sid for sid in station_ids}
         try:
-            for fut in as_completed(futures, timeout=20):
+            for fut in as_completed(futures, timeout=wall_timeout):
                 try:
                     obs = fut.result()
                     if obs:
@@ -129,8 +132,8 @@ def fetch_station_observations_parallel(station_ids, max_workers=12):
                 except Exception:
                     pass
         except FutTimeout:
-            # Some stations never responded — collect whatever finished
-            for fut, sid in futures.items():
+            # Collect whatever managed to finish before the wall clock expired
+            for fut in futures:
                 if fut.done():
                     try:
                         obs = fut.result()
@@ -138,7 +141,7 @@ def fetch_station_observations_parallel(station_ids, max_workers=12):
                             results.append(obs)
                     except Exception:
                         pass
-            log.debug("Parallel fetch timed out; using %d partial results", len(results))
+            log.info("NOAA fetch timed out; collected %d partial results", len(results))
     return results
 
 

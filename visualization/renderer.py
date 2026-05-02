@@ -337,12 +337,15 @@ class WeatherRenderer:
 
     def _toggle_pause(self, event):
         self.paused = not self.paused
-        # Use the animation's own pause/resume so the timer actually stops
+        # Access event_source directly — FuncAnimation.pause()/resume() crash
+        # when event_source is None (e.g. before the Tk mainloop initialises it).
         if hasattr(self, "_anim"):
-            if self.paused:
-                self._anim.pause()
-            else:
-                self._anim.resume()
+            es = getattr(self._anim, "event_source", None)
+            if es is not None:
+                if self.paused:
+                    es.stop()
+                else:
+                    es.start()
         self._btn.label.set_text("[ Play ]" if self.paused else "[Pause]")
         self.fig.canvas.draw_idle()
 
